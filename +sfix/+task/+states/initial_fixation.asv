@@ -1,0 +1,46 @@
+function state = initial_fixation(program, conf)
+
+state = ptb.State();
+state.Name = 'initial_fixation';
+state.Duration = conf.TIMINGS.time_in.initial_fixation;
+
+state.Entry = @(state) entry(state, program);
+state.Loop = @(state) loop(state, program);
+state.Exit = @(state) exit(state, program);
+
+end
+
+function entry(state, program)
+
+state.UserData.acquired = false;
+state.UserData.entered = false;
+
+stimuli = program.Value.stimuli;
+targets = program.Value.targets;
+window = program.Value.window;
+
+reset( targets.initial_fixation );
+draw( stimuli.initial_fixation, window );
+flip( window );
+
+end
+
+function loop(state, program)
+
+targ = program.Value.targets.initial_fixation;
+
+if ( targ.IsInBounds )
+  state.UserData.entered = true;
+  
+elseif ( state.UserData.entered )
+  
+end
+
+end
+
+function exit(state, program)
+
+states = program.Value.states;
+next( state, states('new_trial') );
+
+end

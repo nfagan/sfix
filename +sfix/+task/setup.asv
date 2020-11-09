@@ -20,7 +20,6 @@ function make_all(program, conf)
 
 make_task( program, conf );
 make_states( program, conf );
-make_data( program, conf );
 
 ni_session = make_ni_daq_session( program, conf );
 ni_scan_input = make_ni_scan_input( program, conf, ni_session );
@@ -29,16 +28,15 @@ ni_scan_output = make_ni_scan_output( program, conf, ni_session );
 updater = make_component_updater( program );
 window = make_window( program, conf );
 
-data_directory = program.Value.data_directory;
 tracker = make_eye_tracker( program, updater, ni_scan_input, data_directory, conf );
-sampler = make_gaze_sampler( program, updater, tracker );
+[sampler_m1, sampler_m2] = make_gaze_sampler( program, updater, tracker_m1, tracker_m2 );
+
 make_eye_tracker_sync( program, conf );
 
 make_reward_manager( program, conf, ni_scan_output );
 
 stimuli = make_stimuli( program, window, conf );
-images = make_images( program, conf );
-make_targets( program, updater, window, sampler, stimuli, conf );
+make_targets( program, updater, window, sampler_m1, sampler_m2, stimuli, conf );
 
 make_structure( program, conf );
 make_interface( program, conf );
@@ -70,7 +68,65 @@ program = ptb.Reference( struct() );
 program.Destruct = @sfix.task.shutdown;
 program.Value.debug = struct();
 program.Value.config = conf;
+
+end
+
+function data = make_data(program, conf)
+
+data = ptb.Reference();
+program.Value.data = data;
 program.Value.data_directory = session_data_directory( conf );
+
+end
+
+function manager = make_training_stage_manager(program, conf)
+
+manager = pct.util.TrainingStageManager();
+program.Value.training_stage_manager = manager;
+
+end
+
+function make_training_data(program, conf, params, manager)
+
+initial_stage_name = conf.STRUCTURE.initial_stage_name;
+program.Value.training_data = struct();
+program.Value.training_data.should_advance = false;
+program.Value.training_data.should_revert = false;
+program.Value.training_data.initial_stage_name = initial_stage_name;
+
+params.training_stage_manager_config_func( manager, program );
+
+end
+
+function make_training_stage_name(program, conf)
+
+program.Value.training_stage_name = '';
+
+end
+
+function make_pause_flag( program, conf )
+
+program.Value.pause_flag = false;
+
+end
+
+function generator = make_patch_generator(program, conf)
+
+generator = conf.STRUCTURE.patch_generator( program );
+program.Value.patch_generator = generator;
+
+end
+
+function online_data_rep = make_online_data_rep(program, conf)
+
+online_data_rep = ptb.Reference();
+program.Value.online_data_rep = online_data_rep;
+
+end
+
+function make_percentage_correct_recorder( program, conf )
+
+program.Value.last_n_percent_correct = nan;
 
 end
 
@@ -86,7 +142,7 @@ if ( ~need_make_ni_session(conf) )
 end
 
 ni_session = daq.createSession( 'ni' );
-ni_device_id = sfix.util.get_ni_daq_device_id();
+ni_device_id = pct.util.get_ni_daq_device_id();
 
 m1_channel_x = signal.analog_channel_m1x;
 m1_channel_y = signal.analog_channel_m1y;
@@ -130,6 +186,13 @@ program.Value.ni_scan_output = ni_scan_output;
 
 end
 
+function structure = make_structure(program, conf)
+
+structure = get_structure( conf );
+program.Value.structure = structure;
+
+end
+
 function interface = make_interface(program, conf)
 
 interface = get_interface( conf );
@@ -159,28 +222,10 @@ program.Value.window = window;
 
 end
 
-function structure = make_structure(program, conf)
-
-structure = sfix.task.TrialStructure();
-program.Value.structure = structure;
-
-end
-
-function data = make_data(program, conf)
-
-data = ptb.Reference();
-data.Value = sfix.task.Data.empty();
-
-program.Value.data = data;
-
-end
-
 function states = make_states(program, conf)
 
 states = containers.Map();
-state_names = { 'new_trial', 'initial_fixation', 'error_timeout' ...
-  , 'randomized_fixation', 'iti', 'cs_presentation', 'cs_delay', 'cs_reward' ...
-  , 'image_presentation' };
+state_names = { 'new_trial', 'initial_fixation' };
 
 for i = 1:numel(state_names)
   state_func = sprintf( 'sfix.task.states.%s', state_names{i} );
@@ -188,22 +233,6 @@ for i = 1:numel(state_names)
 end
 
 program.Value.states = states;
-
-end
-
-function images = make_images(program, conf)
-
-image_p = conf.PATHS.images;
-[images, image_filenames] = read_images( image_p );
-
-image_objs = cell( numel(images), 1 );
-for i = 1:numel(image_objs)
-  image_objs{i} = ptb.Image( program.Value.window, images{i} );
-end
-
-program.Value.images = image_objs;
-program.Value.image_arrays = images;
-program.Value.image_filenames = image_filenames;
 
 end
 
@@ -224,26 +253,73 @@ program.Value.stimuli_setup = stim_setup;
 
 end
 
-function targets = make_targets(program, updater, window, sampler, stimuli, conf)
+function targets = make_targets(program, updater, window ...
+  , sampler_m1, sampler_m2, stimuli, conf)
 
 stim_setup = get_stimuli_setup( conf );
 stim_names = fieldnames( stim_setup );
+structure = get_structure( conf );
+patch_distribution_radius =  get_patch_distribution_radius( conf );
 
 targets = struct();
+patch_targets = {};
 
 for i = 1:numel(stim_names)
   stim_name = stim_names{i};
   stim_descr = stim_setup.(stim_name);
   
   if ( stim_descr.has_target )
-    stimulus = stimuli.(stim_name);
-    target = make_target( stim_descr, stimulus, sampler, window );
-    updater.add_component( target );
-    targets.(stim_name) = target;
+    if ( strcmp(stim_name, 'patch') )
+      num_patches = structure.num_patches;
+      patch_targets = cell( num_patches, 1 );
+      
+      for j = 1:num_patches
+        stim_name = pct.util.nth_patch_stimulus_name( j );
+        stimulus = stimuli.(stim_name);
+        
+%         target = make_target( stim_descr, stimulus, sampler_m2, window );
+        target = make_multi_source_target( stim_descr, stimulus ...
+          , sampler_m1, sampler_m2, window );
+        updater.add_component( target );
+        
+        targets.(stim_name) = target;
+        patch_targets{j} = target;
+      end
+    else
+      stimulus = stimuli.(stim_name);
+      target = make_target( stim_descr, stimulus, sampler_m1, window );
+      updater.add_component( target );
+      targets.(stim_name) = target;
+    end
   end
 end
 
 program.Value.targets = targets;
+program.Value.patch_targets = patch_targets;
+program.Value.patch_distribution_radius = patch_distribution_radius;
+
+end
+
+function target = make_multi_source_target(stim_descr, stimulus ...
+  , sampler_m1, sampler_m2, window)
+
+target = ptb.XYMultiSourceTarget();
+add_sampler( target, sampler_m1 );
+add_sampler( target, sampler_m2 );
+
+switch ( stim_descr.class )
+  case {'Rect', 'Oval'}
+    bounds = ptb.bounds.Rect();
+    bounds.BaseRect = ptb.rects.MatchRectangle( stimulus );
+    bounds.BaseRect.Rectangle.Window = window;
+    bounds.Padding = stim_descr.target_padding;
+    
+  otherwise
+    error( 'Unrecognized stimulus class "%s".', stim_descr.class );
+end
+
+target.Bounds = bounds;
+target.Duration = stim_descr.target_duration;
 
 end
 
@@ -313,11 +389,10 @@ function [tracker_m1, edf_filename] = ...
 
 interface = get_interface( conf );
 signal = get_signal( conf );
-screen = get_screen( conf );
 
 m1_source_type = interface.gaze_source_type;
 m1_channel_indices = signal.analog_gaze_input_channel_indices_m1;
-calibration_rect = screen.calibration_rect;
+calibration_rect = conf.CALIB_SCREEN.rect;
 
 [tracker_m1, edf_filename] = make_one_eye_tracker( updater, ni_scan_input ...
   , m1_channel_indices, calibration_rect, m1_source_type, data_directory, conf );
@@ -411,14 +486,18 @@ program.Value.tracker_sync = sync_info;
 
 end
 
-function sampler = make_gaze_sampler(program, updater, tracker)
+function [sampler_m1, sampler_m2] = ...
+  make_gaze_samplers(program, updater, tracker_m1, tracker_m2)
 
-sampler = make_one_gaze_sampler( updater, tracker );
-program.Value.sampler = sampler;
+sampler_m1 = make_gaze_sampler( updater, tracker_m1 );
+sampler_m2 = make_gaze_sampler( updater, tracker_m2 );
+
+program.Value.sampler = sampler_m1;
+program.Value.sampler_m2 = sampler_m2;
 
 end
 
-function sampler = make_one_gaze_sampler(updater, tracker)
+function sampler = make_gaze_sampler(updater, tracker)
 
 sampler = ptb.samplers.Pass();
 sampler.Source = tracker;
@@ -487,9 +566,18 @@ program.Value.arduino_reward_manager = arduino_reward_manager;
 
 end
 
-function fname = edf_filename(session_dir)
+function queue = make_keyboard_queue(program)
 
-fname = shared_utils.io.get_next_numbered_filename( session_dir, '.edf' );
+queue = ptb.keyboard.Queue();
+start( queue );
+program.Value.keyboard_queue = queue;
+
+end
+
+function make_key_listeners(program, keyboard_queue)
+
+add_listener( keyboard_queue ...
+  , @(key_state) pct.training.fixation_training_stage_key_listener(key_state, program) );
 
 end
 
@@ -499,12 +587,9 @@ dir = fullfile( conf.PATHS.data, datestr(now, 'mmddyy') );
 
 end
 
-function [images, image_filenames] = read_images(p)
+function fname = edf_filename(session_dir)
 
-exts = { '.png', '.jpg' };
-imgs = shared_utils.io.find( p, exts );
-images = cellfun( @imread, imgs, 'un', 0 );
-image_filenames = shared_utils.io.filenames( imgs );
+fname = shared_utils.io.get_next_numbered_filename( session_dir, '.edf' );
 
 end
 
@@ -555,10 +640,6 @@ end
 
 function signal = get_signal(conf)
 signal = conf.SIGNAL;
-end
-
-function screen = get_screen(conf)
-screen = conf.SCREEN;
 end
 
 function d = require_directory(d)
